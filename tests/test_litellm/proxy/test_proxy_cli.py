@@ -6,20 +6,19 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
-import fastapi
 import pytest
+from click.testing import CliRunner
 
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system-path
 
-import builtins
 import types
 import urllib.parse as urlparse
 
 import uvicorn
 
-from litellm.proxy.proxy_cli import ProxyInitializationHelpers
+from litellm.proxy.proxy_cli import ProxyInitializationHelpers, run_server
 
 
 @pytest.mark.xdist_group("proxy_cli")
@@ -99,6 +98,13 @@ class TestProxyInitializationHelpers:
         assert args["host"] == "localhost"
         assert args["port"] == 8000
 
+        slim_args = ProxyInitializationHelpers._get_default_unvicorn_init_args(
+            "localhost",
+            8000,
+            app_target=ProxyInitializationHelpers._get_proxy_app_target(slim=True),
+        )
+        assert slim_args["app"] == "litellm.proxy.slim_server:app"
+
         # Test with log_config
         args = ProxyInitializationHelpers._get_default_unvicorn_init_args(
             "localhost", 8000, "log_config.json"
@@ -148,6 +154,29 @@ class TestProxyInitializationHelpers:
             "localhost", 8000, timeout_worker_healthcheck=30
         )
         assert args["timeout_worker_healthcheck"] == 30
+
+    def test_run_server_slim_uses_slim_app_without_proxy_server_import(
+        self, tmp_path, monkeypatch
+    ):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("model_list: []\n")
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("DIRECT_URL", raising=False)
+        run_calls = []
+
+        def fake_uvicorn_run(**kwargs):
+            run_calls.append(kwargs)
+
+        with patch.dict(sys.modules, {"litellm.proxy.proxy_server": None}):
+            with patch("uvicorn.run", side_effect=fake_uvicorn_run):
+                result = CliRunner().invoke(
+                    run_server,
+                    ["--config", str(config_file), "--slim"],
+                )
+
+        assert result.exit_code == 0, result.output
+        assert run_calls[0]["app"] == "litellm.proxy.slim_server:app"
+        assert os.environ["CONFIG_FILE_PATH"] == str(config_file)
 
     def test_get_reload_options_no_config_still_watches_env(self):
         opts = ProxyInitializationHelpers._get_reload_options(None)
@@ -1553,8 +1582,6 @@ class TestProxyInitializationHelpers:
     @patch("builtins.print")
     def test_run_server_no_config_passed(self, mock_print, mock_uvicorn_run):
         """Test that run_server properly handles the case when no config is passed"""
-        import asyncio
-
         from click.testing import CliRunner
 
         from litellm.proxy.proxy_cli import run_server

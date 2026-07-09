@@ -241,12 +241,19 @@ class ProxyInitializationHelpers:
         print(completion_response)
 
     @staticmethod
+    def _get_proxy_app_target(slim: bool) -> str:
+        if slim:
+            return "litellm.proxy.slim_server:app"
+        return "litellm.proxy.proxy_server:app"
+
+    @staticmethod
     def _get_default_unvicorn_init_args(
         host: str,
         port: int,
         log_config: str | None = None,
         keepalive_timeout: int | None = None,
         timeout_worker_healthcheck: int | None = None,
+        app_target: str = "litellm.proxy.proxy_server:app",
     ) -> dict:
         """
         Get the arguments for `uvicorn` worker
@@ -259,7 +266,7 @@ class ProxyInitializationHelpers:
         from litellm._logging import _get_uvicorn_json_log_config
 
         uvicorn_args: Final = {
-            "app": "litellm.proxy.proxy_server:app",
+            "app": app_target,
             "host": host,
             "port": port,
         }
@@ -281,6 +288,59 @@ class ProxyInitializationHelpers:
                     f"Ignoring the flag.\033[0m"
                 )
         return uvicorn_args
+
+    @staticmethod
+    def _run_slim_proxy_server(
+        host: str,
+        port: int,
+        config: str | None,
+        log_config: str | None,
+        keepalive_timeout: int | None,
+        timeout_worker_healthcheck: int | None,
+        max_requests_before_restart: int | None,
+        max_requests_before_restart_jitter: int | None,
+        ssl_keyfile_path: str | None,
+        ssl_certfile_path: str | None,
+        reload: bool,
+        num_workers: int,
+        run_gunicorn: bool,
+        run_hypercorn: bool,
+        run_granian: bool,
+    ) -> None:
+        if config is None:
+            raise click.ClickException("--slim requires --config")
+        if run_gunicorn or run_hypercorn or run_granian:
+            raise click.ClickException(
+                "--slim currently supports uvicorn startup only; remove alternate server flags"
+            )
+
+        import uvicorn
+
+        os.environ["CONFIG_FILE_PATH"] = config
+        app_target = ProxyInitializationHelpers._get_proxy_app_target(slim=True)
+        uvicorn_args = ProxyInitializationHelpers._get_default_unvicorn_init_args(
+            host=host,
+            port=port,
+            log_config=log_config,
+            keepalive_timeout=keepalive_timeout,
+            timeout_worker_healthcheck=timeout_worker_healthcheck,
+            app_target=app_target,
+        )
+        if max_requests_before_restart is not None:
+            uvicorn_args["limit_max_requests"] = max_requests_before_restart
+        if max_requests_before_restart_jitter is not None:
+            ProxyInitializationHelpers._apply_uvicorn_max_requests_jitter(
+                uvicorn_args=uvicorn_args,
+                max_requests_before_restart=max_requests_before_restart,
+                jitter=max_requests_before_restart_jitter,
+            )
+        if ssl_certfile_path is not None and ssl_keyfile_path is not None:
+            uvicorn_args["ssl_keyfile"] = ssl_keyfile_path
+            uvicorn_args["ssl_certfile"] = ssl_certfile_path
+        if reload:
+            ProxyInitializationHelpers._configure_dev_reload(uvicorn_args, config)
+
+        uvicorn.run(**uvicorn_args, workers=num_workers)
 
     @staticmethod
     def _apply_uvicorn_max_requests_jitter(
@@ -923,6 +983,13 @@ class ProxyInitializationHelpers:
     default=False,
     help="Enable uvicorn hot reload (dev only). Also reloads when the --config YAML file changes. Incompatible with --num_workers>1, --run_gunicorn, and --run_hypercorn.",
 )
+@click.option(
+    "--slim",
+    is_flag=True,
+    default=False,
+    help="Start the minimal static-config proxy for chat completions, models, and health only.",
+    envvar="LITELLM_SLIM_PROXY",
+)
 def run_server(
     cli_args,
     host,
@@ -972,6 +1039,7 @@ def run_server(
     enforce_prisma_migration_check: bool,
     use_v2_migration_resolver: bool,
     reload: bool,
+    slim: bool,
 ):
     if cli_args:
         if cli_args == ("xai-oauth", "login"):
@@ -989,6 +1057,26 @@ def run_server(
         from litellm.setup_wizard import run_setup_wizard
 
         run_setup_wizard()
+        return
+
+    if slim:
+        ProxyInitializationHelpers._run_slim_proxy_server(
+            host=host,
+            port=port,
+            config=config,
+            log_config=log_config,
+            keepalive_timeout=keepalive_timeout,
+            timeout_worker_healthcheck=timeout_worker_healthcheck,
+            max_requests_before_restart=max_requests_before_restart,
+            max_requests_before_restart_jitter=max_requests_before_restart_jitter,
+            ssl_keyfile_path=ssl_keyfile_path,
+            ssl_certfile_path=ssl_certfile_path,
+            reload=reload,
+            num_workers=num_workers,
+            run_gunicorn=run_gunicorn,
+            run_hypercorn=run_hypercorn,
+            run_granian=run_granian,
+        )
         return
 
     args: Final = locals()
