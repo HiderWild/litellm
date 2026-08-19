@@ -31,16 +31,36 @@ if (-not $uv) { $uv = Join-Path $env:USERPROFILE ".local\bin\uv.exe" }
 if (-not (Test-Path $uv)) { Write-ServiceLog "uv not found at $uv"; exit 1 }
 if (-not (Test-Path $Config)) { Write-ServiceLog "config not found: $Config"; exit 1 }
 
+# --- Isolate the environment from any inherited session pollution ---
+# When launched from an agent shell (Hermes, Claude Code, etc.) the child
+# process may inherit PYTHONPATH / PYTHONHOME / VIRTUAL_ENV pointing at a
+# DIFFERENT Python, so `uv run litellm` can resolve the wrong pydantic and
+# crash with "ModuleNotFoundError: pydantic_core._pydantic_core". Pin the
+# gateway's Python environment explicitly so it always uses this repo's
+# .venv regardless of how the supervisor was started.
+foreach ($envVar in @('PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE', 'VIRTUAL_ENV', 'VIRTUAL_ENV_PROMPT')) {
+    [Environment]::SetEnvironmentVariable($envVar, $null, 'Process')
+}
+$RootVenvPython = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not (Test-Path $RootVenvPython)) { Write-ServiceLog ".venv not found: $RootVenvPython (run `uv sync` or `python -m venv .venv` first)"; exit 1 }
+Write-ServiceLog "pinned gateway python: $RootVenvPython"
+
+# Keys are embedded in config.local.yaml; the ARK_API_KEY_* env vars are no
+# longer required. Keep a soft warning (not a hard exit) if they are absent.
 $missing = @()
 foreach ($i in 1..3) {
     if (-not [Environment]::GetEnvironmentVariable("ARK_API_KEY_$i")) { $missing += "ARK_API_KEY_$i" }
 }
 if ($missing.Count -gt 0) {
-    Write-ServiceLog "missing env vars: $($missing -join ', ')"
-    exit 1
+    Write-ServiceLog "warn: env vars not set (keys are in config.local.yaml): $($missing -join ', ')"
 }
 
-$runArgs = @("run", "litellm", "--config", $Config, "--port", "$Port", "--slim")
+# Use the repo's own venv launcher directly. `uv run litellm` was failing in
+# the scheduled-task context (uv can't resolve the project env without a
+# parent shell), while .venv\Scripts\litellm.exe starts cleanly.
+$GatewayExe = Join-Path $Root ".venv\Scripts\litellm.exe"
+if (-not (Test-Path $GatewayExe)) { Write-ServiceLog "litellm.exe not found: $GatewayExe"; exit 1 }
+$runArgs = @("--config", $Config, "--port", "$Port", "--slim")
 # Relaunch delay: 5s after a run that lasted >= 10s (a healthy run, so recover
 # fast); doubles up to 60s after a fast crash so a persistent failure can't
 # hammer. Reset to 5s as soon as a run stays up.
@@ -53,9 +73,9 @@ while ($true) {
         continue
     }
 
-    Write-ServiceLog "starting slim gateway: uv $($runArgs -join ' ')"
+    Write-ServiceLog "starting slim gateway: $GatewayExe $($runArgs -join ' ')"
     $start = Get-Date
-    $proc = Start-Process -FilePath $uv -ArgumentList $runArgs `
+    $proc = Start-Process -FilePath $GatewayExe -ArgumentList $runArgs `
         -WorkingDirectory $Root -WindowStyle Hidden `
         -RedirectStandardOutput $StdOutLog -RedirectStandardError $StdErrLog `
         -PassThru -Wait
