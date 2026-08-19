@@ -1,0 +1,21 @@
+$Root = 'D:\Development\Projects\Utilities\litellm'
+$Nssm = Join-Path $Root 'tools\nssm.exe'
+$Py   = Join-Path $Root '.venv\Scripts\python.exe'
+$Cfg  = Join-Path $Root 'config.local.yaml'
+$Svc  = 'LiteLLMGateway'
+sc.exe stop $Svc 2>$null
+sc.exe delete $Svc 2>$null
+Start-Sleep 2
+& $Nssm install $Svc $Py
+& $Nssm set $Svc AppParameters "-c \"from litellm import run_server; run_server()\" --config `"$Cfg`" --port 9374 --slim"
+& $Nssm set $Svc AppDirectory $Root
+& $Nssm set $Svc AppEnvironmentExtra 'PYTHONPATH='
+& $Nssm set $Svc AppStdout  (Join-Path $Root 'litellm.stdout.log')
+& $Nssm set $Svc AppStderr  (Join-Path $Root 'litellm.stderr.log')
+& $Nssm set $Svc ObjectName 'LocalService'
+& $Nssm set $Svc AppExit Default Restart
+& $Nssm set $Svc AppRestartDelay 5000
+& $Nssm set $Svc Start SERVICE_AUTO_START
+& $Nssm start $Svc
+Start-Sleep 8
+& $Nssm status $Svc
