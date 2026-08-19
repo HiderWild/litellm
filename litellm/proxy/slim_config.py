@@ -57,7 +57,8 @@ class SlimConfigFileModel(BaseModel):
 
 @dataclass(frozen=True)
 class SlimProxyConfig:
-    public_model_name: str
+    public_model_name: str | None
+    model_names: frozenset[str]
     model_list_for_router: tuple[dict[str, JsonValue], ...]
     router_settings_for_router: dict[str, JsonValue]
     litellm_settings: dict[str, JsonValue]
@@ -73,9 +74,9 @@ def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
         raise SlimProxyConfigError(str(exc)) from exc
 
     model_names = frozenset(item.model_name for item in config.model_list)
-    if len(model_names) != 1:
+    if len(model_names) < 1:
         raise SlimProxyConfigError(
-            "Slim proxy requires all model_list entries to use a single model_name"
+            "Slim proxy requires at least one model_name"
         )
 
     master_key_value = _resolve_json_value(config.general_settings.master_key)
@@ -96,7 +97,10 @@ def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
         )
 
     return SlimProxyConfig(
-        public_model_name=next(iter(model_names)),
+        public_model_name=(
+            next(iter(model_names)) if len(model_names) == 1 else None
+        ),
+        model_names=model_names,
         model_list_for_router=tuple(
             _model_list_item_to_router_dict(item) for item in config.model_list
         ),

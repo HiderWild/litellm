@@ -29,6 +29,34 @@ class SlimProxyState:
     router: object
 
 
+def _default_model_for_request(state: SlimProxyState) -> str | None:
+    """Single-model config: default to the one public model. Multi-model:
+    client MUST specify model explicitly."""
+    if state.config.public_model_name is not None:
+        return state.config.public_model_name
+    return None
+
+
+def _ensure_model_in_request(request_data: dict, state: SlimProxyState) -> None:
+    """Fill in the default model when the config has exactly one public
+    model; otherwise require the client to specify one."""
+    if "model" not in request_data or not request_data.get("model"):
+        default = _default_model_for_request(state)
+        if default is not None:
+            request_data["model"] = default
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "message": (
+                        "This proxy exposes multiple models; "
+                        "the 'model' field is required"
+                    ),
+                    "type": "invalid_request_error",
+                },
+            )
+
+
 def create_slim_app(
     config_path: str | Path | None = None,
     router_factory: RouterFactory | None = None,
@@ -61,9 +89,14 @@ def create_slim_app(
     @app.get("/models", dependencies=[Depends(_require_master_key)])
     async def models(request: Request) -> dict[str, object]:
         state = _get_state(request)
+        model_ids = (
+            state.config.model_names
+            if state.config.model_names
+            else {state.config.public_model_name}
+        )
         return {
             "object": "list",
-            "data": [{"id": state.config.public_model_name, "object": "model"}],
+            "data": [{"id": m, "object": "model"} for m in sorted(model_ids)],
         }
 
     @app.post("/v1/chat/completions", dependencies=[Depends(_require_master_key)])
@@ -71,7 +104,7 @@ def create_slim_app(
     async def chat_completions(request: Request) -> Response:
         state = _get_state(request)
         request_data = await _read_json_request(request)
-        request_data.setdefault("model", state.config.public_model_name)
+        _ensure_model_in_request(request_data, state)
         try:
             response = await _call_router(state.router, "acompletion", request_data)
         except Exception as exc:
@@ -86,7 +119,7 @@ def create_slim_app(
     async def anthropic_messages(request: Request) -> Response:
         state = _get_state(request)
         request_data = await _read_json_request(request)
-        request_data.setdefault("model", state.config.public_model_name)
+        _ensure_model_in_request(request_data, state)
         try:
             response = await _call_router(
                 state.router, "anthropic_messages", request_data
@@ -108,7 +141,7 @@ def create_slim_app(
             return _anthropic_error_response(
                 status.HTTP_400_BAD_REQUEST, "messages parameter is required"
             )
-        model = request_data.get("model") or state.config.public_model_name
+        model = request_data.get("model") or _default_model_for_request(state)
         try:
             import litellm
 
@@ -187,11 +220,12 @@ async def _require_master_key(
     request: Request,
     authorization: str | None = Header(default=None),
     x_litellm_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None),
 ) -> None:
     state = _get_state(request)
     if state.config.master_key is None:
         return
-    token = _extract_bearer_token(authorization) or x_litellm_api_key
+    token = _extract_bearer_token(authorization) or x_litellm_api_key or x_api_key
     if token != state.config.master_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

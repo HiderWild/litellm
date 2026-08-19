@@ -92,7 +92,7 @@ def test_load_slim_config_master_key_optional_when_unset(tmp_path, monkeypatch):
     assert config.master_key is None
 
 
-def test_load_slim_config_rejects_multiple_public_model_names(tmp_path, monkeypatch):
+def test_load_slim_config_accepts_multiple_public_model_names(tmp_path, monkeypatch):
     monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
     config_path = write_config(
         tmp_path,
@@ -107,8 +107,10 @@ def test_load_slim_config_rejects_multiple_public_model_names(tmp_path, monkeypa
         """,
     )
 
-    with pytest.raises(SlimProxyConfigError, match="single model_name"):
-        load_slim_config(config_path)
+    config = load_slim_config(config_path)
+
+    assert config.model_names == frozenset({"customer-model", "other-model"})
+    assert config.public_model_name is None
 
 
 def test_load_slim_config_rejects_unsupported_routing_strategy(tmp_path, monkeypatch):

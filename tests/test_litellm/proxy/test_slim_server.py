@@ -171,6 +171,19 @@ def test_models_route_requires_auth(tmp_path):
     assert response.json()["error"]["type"] == "authentication_error"
 
 
+def test_models_route_accepts_x_api_key_header(tmp_path):
+    """Anthropic SDK sends `x-api-key` by default; the slim proxy must accept
+    it alongside Authorization: Bearer / x-litellm-api-key."""
+    client, _router = make_client(tmp_path, FakeRouter(DumpableResponse()))
+
+    with client:
+        good = client.get("/v1/models", headers={"x-api-key": "sk-master"})
+        bad = client.get("/v1/models", headers={"x-api-key": "sk-wrong"})
+
+    assert good.status_code == 200
+    assert bad.status_code == 401
+
+
 def test_models_route_returns_single_public_model_for_multiple_deployments(tmp_path):
     client, _router = make_client(tmp_path, FakeRouter(DumpableResponse()))
 
@@ -240,6 +253,91 @@ def test_chat_completion_preserves_requested_public_model(tmp_path):
 
     assert response.status_code == 200
     assert router.calls == [{"model": "customer-model", "messages": []}]
+
+
+def test_models_route_returns_multiple_models_when_config_has_multi_model(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        dedent("""
+            model_list:
+              - model_name: agent-model
+                litellm_params:
+                  model: anthropic/deepseek-v4-flash
+                  api_key: os.environ/ARK_KEY_1
+                  api_base: https://example.com/api/plan
+              - model_name: coding-model
+                litellm_params:
+                  model: anthropic/deepseek-v4-flash
+                  api_key: os.environ/ARK_KEY_2
+                  api_base: https://example.com/api/coding
+        """),
+        encoding="utf-8",
+    )
+    app = create_slim_app(
+        config_path=config_path,
+        router_factory=lambda _config: FakeRouter(DumpableResponse()),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/v1/models", headers={"Authorization": "Bearer sk-master"}
+        )
+
+    assert response.status_code == 200
+    ids = [m["id"] for m in response.json()["data"]]
+    assert set(ids) == {"agent-model", "coding-model"}
+
+
+def test_chat_completion_requires_model_when_multi_model_config(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
+    router = FakeRouter(DumpableResponse())
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        dedent("""
+            model_list:
+              - model_name: agent-model
+                litellm_params:
+                  model: anthropic/deepseek-v4-flash
+                  api_key: os.environ/ARK_KEY_1
+                  api_base: https://example.com/api/plan
+              - model_name: coding-model
+                litellm_params:
+                  model: anthropic/deepseek-v4-flash
+                  api_key: os.environ/ARK_KEY_2
+                  api_base: https://example.com/api/coding
+        """),
+        encoding="utf-8",
+    )
+    app = create_slim_app(
+        config_path=config_path,
+        router_factory=lambda _config: router,
+    )
+
+    with TestClient(app) as client:
+        # Missing model -> 400
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-master"},
+            json={"messages": [{"role": "user", "content": "ping"}]},
+        )
+        assert response.status_code == 400
+
+        # Explicit model -> 200
+        response2 = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-master"},
+            json={
+                "model": "agent-model",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+        )
+        assert response2.status_code == 200
+        assert router.calls[-1]["model"] == "agent-model"
 
 
 def test_chat_completion_maps_router_exception_to_openai_error(tmp_path):
