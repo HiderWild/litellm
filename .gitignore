@@ -47,6 +47,27 @@ proxy_server_config_@.yaml
 proxy_server_config_2.yaml
 litellm/proxy/secret_managers/credentials.json
 hosted_config.yaml
+# --- local gateway runtime (user-specific, never commit) ---
+config.local.yaml
+config.dual.yaml
+config.multimodel.yaml
+config.*.yaml
+config.*.bak*
+.svc-litellm-pass
+litellm.stderr*
+litellm.stdout*
+litellm.service.log
+litellm.stderr.log
+litellm.stdout.log
+.dryrun.ps1
+.env-parse-test*.ps1
+fix-appparams.ps1
+fix-litellm-port.ps1
+fix-litellm-service.ps1
+service-install*.ps1
+setup-litellm-service-account.ps1
+run-elevated.ps1
+.tmp/
 litellm/proxy/tests/node_modules
 litellm/proxy/tests/package.json
 litellm/proxy/tests/package-lock.json
