@@ -56,6 +56,18 @@ class SlimConfigFileModel(BaseModel):
 
 
 @dataclass(frozen=True)
+class RequestLogConfig:
+    """Request/response logging for the slim proxy (diagnostics).
+
+    Mirrors the external log_proxy.py behavior so clients can be debugged
+    without running a separate forwarding proxy.
+    """
+
+    file_path: str
+    body_limit: int = 3000
+
+
+@dataclass(frozen=True)
 class SlimProxyConfig:
     public_model_name: str | None
     model_names: frozenset[str]
@@ -63,6 +75,7 @@ class SlimProxyConfig:
     router_settings_for_router: dict[str, JsonValue]
     litellm_settings: dict[str, JsonValue]
     master_key: str | None
+    request_log: RequestLogConfig | None = None
 
 
 def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
@@ -96,6 +109,9 @@ def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
             "Slim proxy only supports routing_strategy=simple-shuffle"
         )
 
+    litellm_settings = _resolve_json_mapping(config.litellm_settings)
+    request_log = _extract_request_log_config(litellm_settings)
+
     return SlimProxyConfig(
         public_model_name=(
             next(iter(model_names)) if len(model_names) == 1 else None
@@ -105,9 +121,44 @@ def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
             _model_list_item_to_router_dict(item) for item in config.model_list
         ),
         router_settings_for_router=_resolve_json_mapping(router_settings),
-        litellm_settings=_resolve_json_mapping(config.litellm_settings),
+        litellm_settings=litellm_settings,
         master_key=master_key_value if isinstance(master_key_value, str) else None,
+        request_log=request_log,
     )
+
+
+_REQUEST_LOG_KEYS: frozenset[str] = frozenset(
+    {"request_logging", "request_log_file", "request_log_body_limit"}
+)
+
+
+def _extract_request_log_config(
+    litellm_settings: dict[str, JsonValue],
+) -> RequestLogConfig | None:
+    """Pull request-logging settings out of litellm_settings.
+
+    The keys are consumed here (and removed) so they are never forwarded to
+    the litellm module via setattr. Returns None when logging is disabled.
+    """
+    enabled = litellm_settings.pop("request_logging", False)
+    if enabled is not True:
+        for key in _REQUEST_LOG_KEYS:
+            litellm_settings.pop(key, None)
+        return None
+
+    file_path = litellm_settings.pop("request_log_file", None)
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise SlimProxyConfigError(
+            "litellm_settings.request_log_file is required when "
+            "request_logging is enabled"
+        )
+    body_limit = litellm_settings.pop("request_log_body_limit", 3000)
+    if not isinstance(body_limit, int) or body_limit <= 0:
+        raise SlimProxyConfigError(
+            "litellm_settings.request_log_body_limit must be a positive integer"
+        )
+    litellm_settings.pop("request_logging", None)
+    return RequestLogConfig(file_path=file_path.strip(), body_limit=body_limit)
 
 
 def _filter_router_settings(raw_settings: dict[str, object]) -> dict[str, object]:

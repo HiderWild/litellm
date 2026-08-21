@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -13,7 +16,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from litellm.anthropic_interface.exceptions import AnthropicExceptionMapping
-from litellm.proxy.slim_config import SlimProxyConfig, load_slim_config
+from litellm.proxy.slim_config import (
+    RequestLogConfig,
+    SlimProxyConfig,
+    load_slim_config,
+)
 
 if TYPE_CHECKING:
     from litellm.router import Router
@@ -85,6 +92,37 @@ def create_slim_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    def _model_entry(model_id: str, known_ids: set[str]) -> dict[str, object] | None:
+        """Build a /v1/models entry, attaching reasoning (thinking-level)
+        capability metadata so clients like zcode can offer an "off" variant
+        for deepseek-family models instead of forcing thinking on.
+        Returns None when the model id is not part of this gateway's config."""
+        if model_id not in known_ids:
+            return None
+        entry: dict[str, object] = {"id": model_id, "object": "model"}
+        base = model_id.lower()
+        if "deepseek" in base:
+            # deepseek-family reasoning models: allow off/high/max
+            entry["reasoning"] = {
+                "enabled": True,
+                "variants": ["off", "high", "max"],
+                "defaultVariant": "max",
+            }
+        elif "mimo" in base:
+            entry["reasoning"] = {
+                "enabled": True,
+                "variants": ["enabled", "off"],
+                "defaultVariant": "enabled",
+            }
+        elif "glm" in base:
+            entry["reasoning"] = {
+                "enabled": True,
+                "variants": ["low", "max", "high"],
+                "defaultVariant": "max",
+            }
+        # hy3 / kimi / minimax / qwen / others: no reasoning metadata
+        return entry
+
     @app.get("/v1/models", dependencies=[Depends(_require_master_key)])
     @app.get("/models", dependencies=[Depends(_require_master_key)])
     async def models(request: Request) -> dict[str, object]:
@@ -96,8 +134,26 @@ def create_slim_app(
         )
         return {
             "object": "list",
-            "data": [{"id": m, "object": "model"} for m in sorted(model_ids)],
+            "data": [
+                e
+                for m in sorted(model_ids)
+                if (e := _model_entry(m, model_ids)) is not None
+            ],
         }
+
+    @app.get("/v1/models/{model_id}", dependencies=[Depends(_require_master_key)])
+    @app.get("/models/{model_id}", dependencies=[Depends(_require_master_key)])
+    async def model_detail(model_id: str, request: Request) -> dict[str, object]:
+        state = _get_state(request)
+        known = (
+            state.config.model_names
+            if state.config.model_names
+            else {state.config.public_model_name}
+        )
+        entry = _model_entry(model_id, known)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Model not found")
+        return entry
 
     @app.post("/v1/chat/completions", dependencies=[Depends(_require_master_key)])
     @app.post("/chat/completions", dependencies=[Depends(_require_master_key)])
@@ -105,32 +161,58 @@ def create_slim_app(
         state = _get_state(request)
         request_data = await _read_json_request(request)
         _ensure_model_in_request(request_data, state)
+        log = state.config.request_log
+        if log is not None:
+            _log_request(log, request, request_data)
         try:
             response = await _call_router(state.router, "acompletion", request_data)
         except Exception as exc:
+            if log is not None:
+                _append_log_line(
+                    log, f"error status={_exception_status_code(exc)} message={exc}"
+                )
             return _exception_response(exc)
         if request_data.get("stream") is True:
             return StreamingResponse(
-                _sse_events(response), media_type="text/event-stream"
+                _logged_sse(log, _sse_events(response))
+                if log is not None
+                else _sse_events(response),
+                media_type="text/event-stream",
             )
-        return JSONResponse(content=_serialize_response(response))
+        body = _serialize_response(response)
+        if log is not None:
+            _log_response(log, status.HTTP_200_OK, body)
+        return JSONResponse(content=body)
 
     @app.post("/v1/messages", dependencies=[Depends(_require_master_key)])
     async def anthropic_messages(request: Request) -> Response:
         state = _get_state(request)
         request_data = await _read_json_request(request)
         _ensure_model_in_request(request_data, state)
+        log = state.config.request_log
+        if log is not None:
+            _log_request(log, request, request_data)
         try:
             response = await _call_router(
                 state.router, "anthropic_messages", request_data
             )
         except Exception as exc:
+            if log is not None:
+                _append_log_line(
+                    log, f"error status={_exception_status_code(exc)} message={exc}"
+                )
             return _anthropic_error_response(_exception_status_code(exc), str(exc))
         if request_data.get("stream") is True:
             return StreamingResponse(
-                _anthropic_sse_events(response), media_type="text/event-stream"
+                _logged_sse(log, _anthropic_sse_events(response))
+                if log is not None
+                else _anthropic_sse_events(response),
+                media_type="text/event-stream",
             )
-        return JSONResponse(content=_anthropic_response_body(response))
+        body = _anthropic_response_body(response)
+        if log is not None:
+            _log_response(log, status.HTTP_200_OK, body)
+        return JSONResponse(content=body)
 
     @app.post("/v1/messages/count_tokens", dependencies=[Depends(_require_master_key)])
     async def anthropic_count_tokens(request: Request) -> JSONResponse:
@@ -388,6 +470,79 @@ def _anthropic_response_body(response: object) -> object:
 
 def _json_dumps(value: object) -> str:
     return json.dumps(value, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
+# Request/response logging (diagnostics)
+#
+# Mirrors the external log_proxy.py behavior: full request body (truncated),
+# status + response body summary for non-streaming, and event-count + tail
+# summary for streaming SSE responses. Enabled via litellm_settings:
+#
+#   litellm_settings:
+#     request_logging: true
+#     request_log_file: C:/path/to/requests.log
+#     request_log_body_limit: 3000
+# ---------------------------------------------------------------------------
+
+_LOG_LOCK = threading.Lock()
+
+
+def _append_log_line(log: RequestLogConfig, line: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with _LOG_LOCK:
+        try:
+            with open(log.file_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] {line}\n")
+        except OSError:
+            # Logging must never break the proxy; drop the line silently.
+            pass
+
+
+def _log_request(
+    log: RequestLogConfig, request: Request, request_data: dict[str, object]
+) -> None:
+    try:
+        body = json.dumps(request_data, ensure_ascii=False)[: log.body_limit]
+    except (TypeError, ValueError):
+        body = "<unserializable request body>"
+    client = request.client.host if request.client is not None else "?"
+    _append_log_line(
+        log,
+        f"{request.method} {request.url.path} client={client} body={body}",
+    )
+
+
+def _log_response(log: RequestLogConfig, status_code: int, body: object) -> None:
+    try:
+        summary = json.dumps(body, ensure_ascii=False)[: log.body_limit]
+    except (TypeError, ValueError):
+        summary = "<unserializable response body>"
+    _append_log_line(log, f"response status={status_code} body={summary}")
+
+
+async def _logged_sse(
+    log: RequestLogConfig, generator: AsyncIterator[str]
+) -> AsyncIterator[str]:
+    """Wrap an SSE generator, recording event counts + tail when it ends."""
+    counter: Counter[str] = Counter()
+    tail: deque[str] = deque(maxlen=40)
+    total_bytes = 0
+    async for chunk in generator:
+        total_bytes += len(chunk)
+        for line in chunk.splitlines():
+            if line.startswith("event:"):
+                counter[line[6:].strip()] += 1
+            elif line.startswith("data:"):
+                counter["data"] += 1
+        tail.append(chunk)
+        yield chunk
+    tail_text = "".join(tail)[-600:]
+    _append_log_line(
+        log,
+        f"SSE done events={dict(counter)} total_bytes={total_bytes} "
+        f"tail={tail_text}",
+    )
 
 
 app = create_slim_app()
