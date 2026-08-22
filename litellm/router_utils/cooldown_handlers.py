@@ -58,6 +58,27 @@ def is_advisor_orchestration_failure(exception: BaseException | None) -> bool:
     return bool(getattr(exception, _ADVISOR_ORCHESTRATION_FAILURE_ATTR, False))
 
 
+def _is_usage_limit_error(exception_str: str | None) -> bool:
+    """
+    Detect usage/quota exhausted errors that arrive as generic 4XX (usually 400)
+    but semantically mean "this key is out of quota, skip it".
+
+    Upstream providers encode quota exhaustion differently:
+    - opencode.ai zen/go: HTTP 400 with error.type == "GoUsageLimitError",
+      message contains "usage limit reached"
+    - other providers: "quota exceeded", "out of quota", "insufficient_quota",
+      "rate limit" (some map to 429, but some use 400/403)
+    """
+    if not exception_str:
+        return False
+    markers = [
+        "usagelimit", "usage limit", "quota", "insufficient_quota",
+        "out of quota", "limit reached",
+    ]
+    lowered = exception_str.lower()
+    return any(m in lowered for m in markers)
+
+
 def _is_cooldown_required(
     litellm_router_instance: LitellmRouter,
     model_id: str,
@@ -96,6 +117,12 @@ def _is_cooldown_required(
                 return True
 
             elif exception_status == 408 or exception_status == 404:
+                return True
+
+            elif _is_usage_limit_error(exception_str):
+                # Cool down usage/quota exhausted errors (e.g. GoUsageLimitError
+                # from opencode.ai, which returns HTTP 400 but means the key is
+                # out of quota and must be skipped until it recovers)
                 return True
 
             else:

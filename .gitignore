@@ -163,3 +163,4 @@ crash.*.log
 
 ui/litellm-dashboard/out/
 litellm.log
+restart-gateway-go.ps1

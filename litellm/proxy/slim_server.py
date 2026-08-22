@@ -348,9 +348,34 @@ async def _read_json_request(request: Request) -> dict[str, object]:
     return dict(body)
 
 
+# Models that reject tool definitions entirely (verified 2026-08: opencode
+# Console Go returns HTTP 400 [1210]/[1214] on any request carrying a
+# non-empty tools array; empty/no tools works fine). Claude Code and Hermes
+# always attach tools, so strip them before forwarding.
+_NO_TOOLS_MODELS = ("ox-alpha-free",)
+
+
+def _strip_tools_for_no_tools_models(request_data: dict[str, object]) -> None:
+    model = request_data.get("model")
+    if not model:
+        return
+    model_str = str(model)
+    if not any(m in model_str for m in _NO_TOOLS_MODELS):
+        return
+    removed = [k for k in ("tools", "tool_choice") if k in request_data]
+    if removed:
+        for k in removed:
+            request_data.pop(k, None)
+        print(
+            f"[strip-tools] {model_str}: stripped {removed} before upstream call",
+            flush=True,
+        )
+
+
 async def _call_router(
     router: object, method_name: str, request_data: dict[str, object]
 ) -> object:
+    _strip_tools_for_no_tools_models(request_data)
     method = getattr(router, method_name)
     return await method(**request_data)
 
