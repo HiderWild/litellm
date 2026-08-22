@@ -11,7 +11,6 @@ from litellm.proxy.slim_server import (
     _anthropic_error_response,
     _anthropic_sse_chunk,
     _apply_litellm_settings,
-    _strip_tools_for_no_tools_models,
     create_slim_app,
 )
 
@@ -125,44 +124,6 @@ def test_anthropic_error_response_builds_anthropic_body() -> None:
         "type": "error",
         "error": {"type": "rate_limit_error", "message": "rate limited"},
     }
-
-
-def test_strip_tools_removes_tools_and_tool_choice_for_no_tools_model() -> None:
-    data = {
-        "model": "ox-alpha-free",
-        "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"name": "x"}],
-        "tool_choice": {"type": "auto"},
-    }
-
-    _strip_tools_for_no_tools_models(data)
-
-    assert "tools" not in data
-    assert "tool_choice" not in data
-    assert data["model"] == "ox-alpha-free"
-    assert data["messages"]
-
-
-def test_strip_tools_leaves_other_models_untouched() -> None:
-    data = {
-        "model": "deepseek-v4-flash-go",
-        "tools": [{"name": "x"}],
-        "tool_choice": {"type": "auto"},
-    }
-
-    _strip_tools_for_no_tools_models(data)
-
-    assert "tools" in data
-    assert "tool_choice" in data
-
-
-def test_strip_tools_noop_when_no_tools_present() -> None:
-    data = {"model": "ox-alpha-free", "messages": [{"role": "user", "content": "hi"}]}
-
-    _strip_tools_for_no_tools_models(data)
-
-    assert "tools" not in data
-    assert data["messages"]
 
 
 def test_anthropic_sse_chunk_passes_through_bytes() -> None:
