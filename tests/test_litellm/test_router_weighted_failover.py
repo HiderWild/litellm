@@ -101,6 +101,33 @@ def test_set_failed_deployment_id_on_exception():
 
 
 @pytest.mark.asyncio
+async def test_generic_api_helper_stamps_failed_deployment_id():
+    """Generic endpoints must expose the failed deployment to same-group failover."""
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "gpt-4o", "api_key": "key"},
+                "model_info": {"id": "dep-generic"},
+            }
+        ],
+        num_retries=0,
+        enable_weighted_failover=True,
+    )
+
+    async def _failing_generic_function(**_kwargs):
+        raise RuntimeError("generic deployment failed")
+
+    with pytest.raises(RuntimeError) as raised:
+        await router._ageneric_api_call_with_fallbacks_helper(
+            model="test-model",
+            original_generic_function=_failing_generic_function,
+        )
+
+    assert getattr(raised.value, "failed_deployment_id", None) == "dep-generic"
+
+
+@pytest.mark.asyncio
 async def test_maybe_run_weighted_failover_returns_none_without_failed_id():
     router = Router(
         model_list=[
