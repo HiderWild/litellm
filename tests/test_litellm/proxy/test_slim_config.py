@@ -207,3 +207,63 @@ def test_load_slim_config_accepts_litellm_settings(tmp_path, monkeypatch):
         "request_timeout": 120,
         "telemetry": False,
     }
+
+
+def test_load_slim_config_detects_opencode_zen_go_models(tmp_path, monkeypatch):
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
+    config_path = write_config(
+        tmp_path,
+        """
+        model_list:
+          - model_name: deepseek-v4-flash-go
+            litellm_params:
+              model: openai/deepseek-v4-flash
+              api_key: sk-one
+              api_base: https://opencode.ai/zen/go/v1
+          - model_name: deepseek-v4-pro-go
+            litellm_params:
+              model: anthropic/deepseek-v4-pro
+              api_key: sk-two
+              api_base: https://opencode.ai/zen/go
+          - model_name: hy3-free
+            litellm_params:
+              model: openai/hy3-free
+              api_key: sk-three
+              api_base: https://opencode.ai/zen/v1
+          - model_name: glm-5.3
+            litellm_params:
+              model: anthropic/glm-5.3
+              api_key: sk-four
+              api_base: https://ark.cn-beijing.volces.com/api/plan
+        """,
+    )
+
+    config = load_slim_config(config_path)
+
+    assert config.opencode_model_names == frozenset(
+        {"deepseek-v4-flash-go", "deepseek-v4-pro-go"}
+    )
+
+
+def test_load_slim_config_opencode_models_empty_without_zen_go(tmp_path, monkeypatch):
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master")
+    config_path = write_config(
+        tmp_path,
+        """
+        model_list:
+          - model_name: hy3-free
+            litellm_params:
+              model: openai/hy3-free
+              api_key: sk-one
+              api_base: https://opencode.ai/zen/v1
+          - model_name: glm-5.3
+            litellm_params:
+              model: anthropic/glm-5.3
+              api_key: sk-two
+              api_base: https://ark.cn-beijing.volces.com/api/plan
+        """,
+    )
+
+    config = load_slim_config(config_path)
+
+    assert config.opencode_model_names == frozenset()

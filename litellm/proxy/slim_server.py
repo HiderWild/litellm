@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -62,6 +63,127 @@ def _ensure_model_in_request(request_data: dict, state: SlimProxyState) -> None:
                     "type": "invalid_request_error",
                 },
             )
+
+
+_OPENCODE_SESSION_HEADER = "x-opencode-session"
+_OPENCODE_SESSION_MAX_LENGTH = 128
+_OPENCODE_SESSION_FALLBACK = "litellm-unattributed"
+
+
+def _inject_opencode_session(
+    request_data: dict, request: Request, state: SlimProxyState
+) -> None:
+    """Attach a per-conversation x-opencode-session header for opencode
+    zen/go models (the upstream rejects requests without it).
+
+    The value rides the request-kwarg ``extra_headers`` channel: the router
+    spreads request kwargs over deployment litellm_params (``_acompletion``
+    and ``_ageneric_api_call_with_fallbacks_helper``), and both provider
+    paths merge it into the outbound headers (OpenAI SDK per-request
+    headers; BaseLLMHTTPHandler reads ``kwargs["extra_headers"]`` - the
+    anthropic request-utils whitelist keeps it out of the request body).
+    Note request-level extra_headers replaces a deployment-level dict
+    wholesale; no current config sets one.
+
+    Session id priority (most to least stable per conversation):
+    1. inbound x-opencode-session header forwarded verbatim (documented
+       proxy behavior for clients that send one, e.g. opencode CLI)
+    2. body ``metadata.user_id`` JSON containing ``session_id`` (zcode
+       sends this natively on every turn)
+    3. sha256 over model + first user message - stable across the turns
+       of one conversation because agents append messages instead of
+       rewriting the head; deliberately excludes system prompts, which
+       often carry timestamps that would churn the id every turn
+    4. static fallback when no user message exists
+    """
+    model = request_data.get("model")
+    if not isinstance(model, str) or model not in state.config.opencode_model_names:
+        return
+    session_id = (
+        _inbound_opencode_session(request)
+        or _metadata_session_id(request_data)
+        or _derived_session_id(request_data)
+    )
+    extra_headers = request_data.get("extra_headers")
+    if not isinstance(extra_headers, dict):
+        extra_headers = {}
+    request_data["extra_headers"] = {
+        **extra_headers,
+        _OPENCODE_SESSION_HEADER: session_id,
+    }
+
+
+def _inbound_opencode_session(request: Request) -> str | None:
+    value = request.headers.get(_OPENCODE_SESSION_HEADER)
+    if value is None:
+        return None
+    value = value.strip()
+    if not value or len(value) > _OPENCODE_SESSION_MAX_LENGTH:
+        return None
+    # Control characters make httpx/OpenAI SDK raise while sending the
+    # header; a client mistake should not become a gateway 500.
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return None
+    return value
+
+
+def _metadata_session_id(request_data: dict) -> str | None:
+    metadata = request_data.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    user_id = metadata.get("user_id")
+    if not isinstance(user_id, str):
+        return None
+    try:
+        parsed = json.loads(user_id)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    session_id = parsed.get("session_id")
+    if not isinstance(session_id, str):
+        return None
+    session_id = session_id.strip()
+    if not session_id or len(session_id) > _OPENCODE_SESSION_MAX_LENGTH:
+        return None
+    return session_id
+
+
+def _derived_session_id(request_data: dict) -> str:
+    first_user = _first_user_message_text(request_data)
+    if first_user is None:
+        return _OPENCODE_SESSION_FALLBACK
+    digest = hashlib.sha256(
+        f"{request_data.get('model', '')}\x00{first_user[:4096]}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"litellm-{digest}"
+
+
+def _first_user_message_text(request_data: dict) -> str | None:
+    """First user-role message text. Covers both body shapes: OpenAI chat
+    (first ``role=user`` entry) and Anthropic messages (content may be a
+    plain string or a list of text blocks; non-text blocks are ignored)."""
+    messages = request_data.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _message_content_text(message.get("content"))
+    return None
+
+
+def _message_content_text(content: object) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get("text")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        text = "\n".join(part for part in parts if isinstance(part, str))
+        return text or None
+    return None
 
 
 def create_slim_app(
@@ -161,6 +283,7 @@ def create_slim_app(
         state = _get_state(request)
         request_data = await _read_json_request(request)
         _ensure_model_in_request(request_data, state)
+        _inject_opencode_session(request_data, request, state)
         log = state.config.request_log
         if log is not None:
             _log_request(log, request, request_data)
@@ -189,6 +312,7 @@ def create_slim_app(
         state = _get_state(request)
         request_data = await _read_json_request(request)
         _ensure_model_in_request(request_data, state)
+        _inject_opencode_session(request_data, request, state)
         log = state.config.request_log
         if log is not None:
             _log_request(log, request, request_data)

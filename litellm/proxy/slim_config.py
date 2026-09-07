@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias
+from typing import Final, TypeAlias
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -76,6 +76,7 @@ class SlimProxyConfig:
     litellm_settings: dict[str, JsonValue]
     master_key: str | None
     request_log: RequestLogConfig | None = None
+    opencode_model_names: frozenset[str] = frozenset()
 
 
 def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
@@ -112,18 +113,28 @@ def load_slim_config(config_path: str | Path) -> SlimProxyConfig:
     litellm_settings = _resolve_json_mapping(config.litellm_settings)
     request_log = _extract_request_log_config(litellm_settings)
 
+    model_list_for_router = tuple(
+        _model_list_item_to_router_dict(item) for item in config.model_list
+    )
+    opencode_model_names = frozenset(
+        entry["model_name"]
+        for entry in model_list_for_router
+        if _is_opencode_zen_go_entry(entry)
+    )
+    if opencode_model_names:
+        _log_opencode_models(opencode_model_names)
+
     return SlimProxyConfig(
         public_model_name=(
             next(iter(model_names)) if len(model_names) == 1 else None
         ),
         model_names=model_names,
-        model_list_for_router=tuple(
-            _model_list_item_to_router_dict(item) for item in config.model_list
-        ),
+        model_list_for_router=model_list_for_router,
         router_settings_for_router=_resolve_json_mapping(router_settings),
         litellm_settings=litellm_settings,
         master_key=master_key_value if isinstance(master_key_value, str) else None,
         request_log=request_log,
+        opencode_model_names=opencode_model_names,
     )
 
 
@@ -159,6 +170,31 @@ def _extract_request_log_config(
         )
     litellm_settings.pop("request_logging", None)
     return RequestLogConfig(file_path=file_path.strip(), body_limit=body_limit)
+
+
+_OPENCODE_ZEN_GO_MARKER: Final = "opencode.ai/zen/go"
+
+
+def _is_opencode_zen_go_entry(entry: dict[str, JsonValue]) -> bool:
+    """True when the deployment targets opencode zen/go.
+
+    The marker matches both bases used in model_list configs:
+    ``https://opencode.ai/zen/go/v1`` (OpenAI format) and
+    ``https://opencode.ai/zen/go`` (Anthropic format), while excluding
+    ``https://opencode.ai/zen/v1`` (free tier) - the x-opencode-session
+    header is a zen/go requirement only.
+    """
+    api_base = entry.get("litellm_params", {}).get("api_base")
+    return isinstance(api_base, str) and _OPENCODE_ZEN_GO_MARKER in api_base
+
+
+def _log_opencode_models(models: frozenset[str]) -> None:
+    from litellm._logging import verbose_proxy_logger
+
+    verbose_proxy_logger.info(
+        "Slim proxy injecting x-opencode-session for models: %s",
+        ", ".join(sorted(models)),
+    )
 
 
 def _filter_router_settings(raw_settings: dict[str, object]) -> dict[str, object]:
